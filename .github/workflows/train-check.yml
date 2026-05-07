@@ -1,0 +1,68 @@
+name: Check Graysville Train Camera
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-camera:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright ultralytics opencv-python-headless
+          python -m playwright install --with-deps chromium
+
+      - name: Check camera for train
+        run: python check_train.py
+
+      - name: Upload latest screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-screenshot
+          path: camera_screenshot.jpg
+          retention-days: 1
+
+      - name: Ensure alert label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create train-alert --color FFA500 --description "Train camera alert" || true
+
+      - name: Create or close train alert issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DETECTED=$(cat train_detected.txt)
+          CONF=$(cat confidence.txt)
+
+          if [ "$DETECTED" = "true" ]; then
+            EXISTING=$(gh issue list --label train-alert --state open --json number --jq '.[0].number')
+
+            if [ -z "$EXISTING" ]; then
+              gh issue create \
+                --title "🚂 Train detected at Graysville crossing" \
+                --label train-alert \
+                --body "A train may be present at the Graysville crossing camera. Confidence: $CONF. Check the latest workflow artifact for the screenshot."
+            else
+              echo "Train already alerted in open issue #$EXISTING"
+            fi
+          else
+            for ISSUE in $(gh issue list --label train-alert --state open --json number --jq '.[].number'); do
+              gh issue close "$ISSUE" --comment "No train detected on the latest check."
+            done
+          fi

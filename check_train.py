@@ -2,7 +2,8 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from ultralytics import YOLO
 
-CAMERA_URL = "https://vkda.co/s/CvNDqTVk1afUEG2b"
+# Public Catoosa County page, not the direct Verkada login link
+CAMERA_URL = "https://www.catoosacountyga.gov/government/graysville-train-crossing-camera-test"
 
 SCREENSHOT = "camera_screenshot.jpg"
 RESULT_FILE = "train_detected.txt"
@@ -12,14 +13,28 @@ CONF_FILE = "confidence.txt"
 def take_screenshot():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = browser.new_page(viewport={"width": 1280, "height": 720})
+
+        page = browser.new_page(
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
 
         try:
             page.goto(CAMERA_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(15000)
+
+            # Give the embedded camera/page time to load
+            page.wait_for_timeout(20000)
+
+            # Take screenshot of what GitHub can actually see
             page.screenshot(path=SCREENSHOT, full_page=False)
+
         except PlaywrightTimeoutError:
             page.screenshot(path=SCREENSHOT, full_page=False)
+
         finally:
             browser.close()
 

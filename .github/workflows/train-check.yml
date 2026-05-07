@@ -1,68 +1,95 @@
-name: Check Graysville Train Camera
+from pathlib import Path
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from ultralytics import YOLO
 
-on:
-  schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+# Start on the Catoosa County public page
+COUNTY_PAGE_URL = "https://www.catoosacountyga.gov/government/graysville-train-crossing-camera-test"
 
-permissions:
-  contents: read
-  issues: write
+SCREENSHOT = "camera_screenshot.jpg"
+RESULT_FILE = "train_detected.txt"
+CONF_FILE = "confidence.txt"
+STATUS_FILE = "page_status.txt"
 
-jobs:
-  check-camera:
-    runs-on: ubuntu-latest
 
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
+def take_screenshot():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        page = browser.new_page(
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
 
-      - name: Install dependencies
-        run: |
-          pip install playwright ultralytics opencv-python-headless
-          python -m playwright install --with-deps chromium
+        try:
+            # Open the public county page first
+            page.goto(COUNTY_PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(5000)
 
-      - name: Check camera for train
-        run: python check_train.py
+            # Click the county's "Enlarged View" link, which should open the actual camera
+            with page.expect_popup(timeout=15000) as popup_info:
+                page.get_by_text("Enlarged View").click()
 
-      - name: Upload latest screenshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: camera-screenshot
-          path: camera_screenshot.jpg
-          retention-days: 1
+            camera_page = popup_info.value
+            camera_page.wait_for_load_state("domcontentloaded", timeout=60000)
 
-      - name: Ensure alert label exists
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh label create train-alert --color FFA500 --description "Train camera alert" || true
+            # Give the camera stream time to load
+            camera_page.wait_for_timeout(25000)
 
-      - name: Create or close train alert issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          DETECTED=$(cat train_detected.txt)
-          CONF=$(cat confidence.txt)
+            # Save what GitHub actually sees
+            camera_page.screenshot(path=SCREENSHOT, full_page=False)
 
-          if [ "$DETECTED" = "true" ]; then
-            EXISTING=$(gh issue list --label train-alert --state open --json number --jq '.[0].number')
+            page_text = camera_page.locator("body").inner_text(timeout=10000).lower()
 
-            if [ -z "$EXISTING" ]; then
-              gh issue create \
-                --title "🚂 Train detected at Graysville crossing" \
-                --label train-alert \
-                --body "A train may be present at the Graysville crossing camera. Confidence: $CONF. Check the latest workflow artifact for the screenshot."
-            else
-              echo "Train already alerted in open issue #$EXISTING"
-            fi
-          else
-            for ISSUE in $(gh issue list --label train-alert --state open --json number --jq '.[].number'); do
-              gh issue close "$ISSUE" --comment "No train detected on the latest check."
-            done
-          fi
+            if "log in" in page_text or "enter the email address" in page_text:
+                Path(STATUS_FILE).write_text("blocked_login_page")
+            else:
+                Path(STATUS_FILE).write_text("camera_page_loaded")
+
+        except PlaywrightTimeoutError:
+            page.screenshot(path=SCREENSHOT, full_page=False)
+            Path(STATUS_FILE).write_text("timeout")
+
+        except Exception as e:
+            page.screenshot(path=SCREENSHOT, full_page=False)
+            Path(STATUS_FILE).write_text(f"error: {e}")
+
+        finally:
+            browser.close()
+
+
+def detect_train():
+    status = Path(STATUS_FILE).read_text() if Path(STATUS_FILE).exists() else "unknown"
+
+    # Do not analyze a login page
+    if status in ["blocked_login_page", "timeout"] or status.startswith("error"):
+        Path(RESULT_FILE).write_text("false")
+        Path(CONF_FILE).write_text("0.0")
+        return
+
+    model = YOLO("yolov8n.pt")
+    results = model.predict(SCREENSHOT, conf=0.35, verbose=False)
+
+    best_conf = 0.0
+    train_found = False
+
+    for result in results:
+        for box in result.boxes:
+            class_id = int(box.cls[0])
+            label = model.names[class_id].lower()
+            confidence = float(box.conf[0])
+
+            if label == "train":
+                train_found = True
+                best_conf = max(best_conf, confidence)
+
+    Path(RESULT_FILE).write_text("true" if train_found else "false")
+    Path(CONF_FILE).write_text(str(round(best_conf, 3)))
+
+
+if __name__ == "__main__":
+    take_screenshot()
+    detect_train()
